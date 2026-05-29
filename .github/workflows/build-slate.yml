@@ -3,8 +3,7 @@ name: Build MLB Hit Prop Slate
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 20-23 * * *"
-    - cron: "*/15 0-2 * * *"
+        - cron: "15,45 15-23 * * *"  # Every 30 min, 11:15 AM - 7:45 PM ET (15:15-23:45 UTC)
 
 permissions:
   contents: write
