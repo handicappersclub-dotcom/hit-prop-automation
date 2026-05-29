@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-MLB Hit Prop Enrichment Pipeline — build_slate.py
+MLB Hit Prop Enrichment Pipeline -- build_slate.py
 Produces data/latest-enriched-slate.json matching the V7.1 dashboard schema.
 
 SECRETS (via GitHub Secrets / env vars):
-  ODDS_API_KEY       — The Odds API key for batter_hits player props
-    PERPLEXITY_API_KEY — Perplexity API key (optional, for lineup parsing)
+  ODDS_API_KEY         -- The Odds API key for batter_hits player props
+  PERPLEXITY_API_KEY   -- Perplexity API key (optional, for lineup parsing)
 
-    DATA SOURCES (V1 — manual CSV inputs, swap-in-place for live APIs):
-      data/candidates.csv  — hitter,team,opp,pitcher
-        data/lineups.csv     — team,slot,hitter
-          data/weather.csv     — team,opp,conditions,tempF,wind
-            (odds pulled live from The Odds API if ODDS_API_KEY is set)
-            """
+DATA SOURCES (V1 -- manual CSV inputs):
+  data/candidates.csv  -- hitter_name,team,opp,pitcher_name,...
+  data/lineups.csv     -- team,slot,hitter_name
+  data/weather.csv     -- home_team,away_team,condition,tempF,wind
+  data/odds.csv        -- hitter_name,team,overOdds,underOdds,booksAgreeing,sourceBook
+  (odds pulled live from The Odds API if ODDS_API_KEY is set)
+"""
 
 import os
 import json
@@ -26,355 +27,426 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-DATA_DIR   = Path(__file__).parent.parent / "data"
+DATA_DIR = Path(__file__).parent.parent / "data"
 OUTPUT_FILE = DATA_DIR / "latest-enriched-slate.json"
 
-ODDS_API_KEY       = os.environ.get("ODDS_API_KEY", "")
-ODDS_API_BASE      = "https://api.the-odds-api.com/v4"
-PREFERRED_BOOK     = "fanduel"
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+PREFERRED_BOOK = "fanduel"
+
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+
+def normalize(name: str) -> str:
+    """Lowercase + remove non-alphanumeric for fuzzy matching."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _parse_int(val, default=None):
+    try:
+        return int(str(val).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_float(val, default=None):
+    try:
+        return float(str(val).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_odds(val):
+    """Parse American odds string like '-230' or '+180' to int."""
+    try:
+        s = str(val).strip().replace("+", "")
+        return int(s)
+    except (ValueError, TypeError):
+        return None
+
 
 # ──────────────────────────────────────────────
 # SECTION 1: DATA FETCHERS
 # ──────────────────────────────────────────────
 
-def fetch_candidate_rows() -> list[dict]:
-      """
-          Returns list of {hitter, team, opp, pitcher}.
-              V1: reads data/candidates.csv
-                  Future: swap in MLB Stats API or Google Sheets API call.
-                      """
-      path = DATA_DIR / "candidates.csv"
-      if not path.exists():
-                log.warning("candidates.csv not found — returning empty list")
-                return []
-            with open(path, newline="", encoding="utf-8") as f:
-                      return [row for row in csv.DictReader(f) if any(row.values())]
+def fetch_candidate_rows() -> list:
+    """Returns list of dicts from candidates.csv."""
+    path = DATA_DIR / "candidates.csv"
+    if not path.exists():
+        log.warning("candidates.csv not found -- returning empty list")
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        return [row for row in csv.DictReader(f) if any(row.values())]
 
 
-def fetch_confirmed_lineups() -> list[dict]:
-      """
-          Returns list of {team, slot, hitter}.
-              Only include rows where slot is 1–9 and source confirmed it.
-                  V1: reads data/lineups.csv
-                      Future: swap in MLB Stats API /lineup endpoint or Perplexity parser.
-                          """
+def fetch_confirmed_lineups() -> list:
+    """Returns list of {team, slot, hitter_name} from lineups.csv."""
     path = DATA_DIR / "lineups.csv"
     if not path.exists():
-              log.warning("lineups.csv not found — all players will be unconfirmed")
-              return []
-          rows = []
+        log.warning("lineups.csv not found -- all players will be unconfirmed")
+        return []
+    rows = []
     with open(path, newline="", encoding="utf-8") as f:
-              for row in csv.DictReader(f):
-                            try:
-                                              slot = int(row.get("slot", ""))
-                                              if 1 <= slot <= 9:
-                                                                    rows.append({**row, "slot": slot})
-                            except (ValueError, TypeError):
-                                              log.warning(f"Lineups: invalid slot '{row.get('slot')}' for {row.get('hitter')} — skipping")
-                                  return rows
+        for row in csv.DictReader(f):
+            try:
+                slot = int(row.get("slot", ""))
+                if 1 <= slot <= 9:
+                    rows.append({**row, "slot": slot})
+            except (ValueError, TypeError):
+                log.warning(
+                    f"Lineups: invalid slot '{row.get('slot')}' for "
+                    f"{row.get('hitter_name')} -- skipping"
+                )
+    return rows
 
 
-def fetch_weather() -> list[dict]:
-      """
-          Returns list of {team, opp, conditions, tempF, wind}.
-              V1: reads data/weather.csv
-                  Future: swap in Open-Meteo API call using stadium coordinates.
-                      """
+def fetch_weather() -> list:
+    """Returns list of weather rows from weather.csv."""
     path = DATA_DIR / "weather.csv"
     if not path.exists():
-              log.warning("weather.csv not found — context will be empty")
-              return []
-          with open(path, newline="", encoding="utf-8") as f:
-                    return [row for row in csv.DictReader(f) if any(row.values())]
-
-
-def fetch_batter_hits_odds() -> list[dict]:
-      """
-          Returns list of {player, team, overOdds, underOdds, booksAgreeing, book}.
-              Rules:
-                    - marketKey must be batter_hits
-                          - line must be 0.5
-                                - side over/under only
-                                      - no total bases, RBI, runs, SGP, parlay-leg, alternate hits
-                                          V1: uses The Odds API if ODDS_API_KEY is set; else reads data/odds.csv
-                                              """
-      if ODDS_API_KEY:
-                return _fetch_odds_api()
-            path = DATA_DIR / "odds.csv"
-    if not path.exists():
-              log.warning("odds.csv not found and no ODDS_API_KEY — market will be empty")
-              return []
-          rows = []
+        log.warning("weather.csv not found -- context will be empty")
+        return []
     with open(path, newline="", encoding="utf-8") as f:
-              for row in csv.DictReader(f):
-                            try:
-                                              over  = _parse_odds(row.get("overOdds",  ""))
-                                              under = _parse_odds(row.get("underOdds", ""))
-                                              if over is None or under is None:
-                                                                    log.warning(f"Odds CSV: incomplete odds for {row.get('player')} — skipping")
-                                                                    continue
-                                                                rows.append({
-                                                  "player":        row.get("player", "").strip(),
-                                                  "team":          row.get("team",   "").strip().upper(),
-                                                  "overOdds":      over,
-                                                  "underOdds":     under,
-                                                  "booksAgreeing": _parse_int(row.get("booksAgreeing", "1")) or 1,
-                                                  "book":          row.get("book", "manual").strip(),
-                                              })
-except Exception as e:
+        return [row for row in csv.DictReader(f) if any(row.values())]
+
+
+def fetch_batter_hits_odds() -> list:
+    """
+    Returns list of odds dicts.
+    Uses The Odds API if ODDS_API_KEY is set, else reads odds.csv.
+    Only accepts marketKey=batter_hits, line=0.5.
+    """
+    if ODDS_API_KEY:
+        return _fetch_odds_api()
+    path = DATA_DIR / "odds.csv"
+    if not path.exists():
+        log.warning("odds.csv not found and no ODDS_API_KEY -- market will be empty")
+        return []
+    rows = []
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                over = _parse_odds(row.get("overOdds", ""))
+                under = _parse_odds(row.get("underOdds", ""))
+                if over is None or under is None:
+                    continue
+                rows.append({
+                    "player": row.get("hitter_name", "").strip(),
+                    "team": row.get("team", "").strip().upper(),
+                    "overOdds": over,
+                    "underOdds": under,
+                    "booksAgreeing": _parse_int(row.get("booksAgreeing", "1")) or 1,
+                    "book": row.get("sourceBook", "manual").strip(),
+                })
+            except Exception as e:
                 log.warning(f"Odds CSV row error: {e}")
     return rows
 
 
-def _fetch_odds_api() -> list[dict]:
-      """Pull batter_hits 0.5 odds from The Odds API."""
+def _fetch_odds_api() -> list:
+    """Pull batter_hits 0.5 odds from The Odds API."""
     try:
-              # Get upcoming MLB events
-              resp = requests.get(
-                            f"{ODDS_API_BASE}/sports/baseball_mlb/events",
-                            params={"apiKey": ODDS_API_KEY, "dateFormat": "iso"},
-                            timeout=15,
-              )
-              resp.raise_for_status()
-              events = resp.json()
-              log.info(f"Odds API: {len(events)} MLB events found")
-except Exception as e:
+        resp = requests.get(
+            f"{ODDS_API_BASE}/sports/baseball_mlb/events",
+            params={"apiKey": ODDS_API_KEY, "dateFormat": "iso"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        log.info(f"Odds API: {len(events)} MLB events found")
+    except Exception as e:
         log.error(f"Odds API events fetch failed: {e}")
         return []
 
     results = []
-    for event in events[:10]:  # limit to avoid API quota burn
-              event_id = event.get("id")
-              try:
-                            resp = requests.get(
-                                              f"{ODDS_API_BASE}/sports/baseball_mlb/events/{event_id}/odds",
-                                              params={
-                                                                    "apiKey":   ODDS_API_KEY,
-                                                                    "regions":  "us",
-                                                                    "markets":  "batter_hits",
-                                                                    "oddsFormat": "american",
-                                                                    "dateFormat": "iso",
-                                              },
-                                              timeout=15,
-                            )
-                            resp.raise_for_status()
-                            data = resp.json()
-except Exception as e:
+    for event in events[:10]:
+        event_id = event.get("id")
+        try:
+            resp = requests.get(
+                f"{ODDS_API_BASE}/sports/baseball_mlb/events/{event_id}/odds",
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": "us",
+                    "markets": "batter_hits",
+                    "oddsFormat": "american",
+                    "dateFormat": "iso",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
             log.warning(f"Odds API: failed for event {event_id}: {e}")
             continue
 
         for book in data.get("bookmakers", []):
-                      for mkt in book.get("markets", []):
-                                        if mkt.get("key") != "batter_hits":
-                                                              continue
-                                                          # Group outcomes by description (player name)
-                                                          player_map = {}
-                                        for outcome in mkt.get("outcomes", []):
-                                                              pt = outcome.get("point")
-                                                              if pt != 0.5:
-                                                                                        continue  # only 0.5 line
+            for mkt in book.get("markets", []):
+                if mkt.get("key") != "batter_hits":
+                    continue
+                player_map = {}
+                for outcome in mkt.get("outcomes", []):
+                    if outcome.get("point") != 0.5:
+                        continue
                     desc = outcome.get("description", "")
                     side = outcome.get("name", "").lower()
                     if side not in ("over", "under"):
-                                              continue
-                                          if desc not in player_map:
-                                                                    player_map[desc] = {}
-                                                                player_map[desc][side] = outcome.get("price")
+                        continue
+                    if desc not in player_map:
+                        player_map[desc] = {"over": None, "under": None}
+                    player_map[desc][side] = outcome.get("price")
 
+                book_name = book.get("key", "unknown")
                 for player_name, sides in player_map.items():
-                                      if "over" not in sides or "under" not in sides:
-                                                                continue
-                                                            # Determine team from event home/away
-                                                            home_team = event.get("home_team", "")
-                    away_team = event.get("away_team", "")
-                    team_abbr = _guess_team_abbr(player_name, home_team, away_team)
-
-                    key = _norm(player_name) + "|" + team_abbr
-                    if key not in {_norm(r["player"]) + "|" + r["team"] for r in results}:
-                                              # Count books agreeing
-                                              books_count = sum(
-                                                                            1 for b in data.get("bookmakers", [])
-                                                                            for m in b.get("markets", [])
-                                                                            if m.get("key") == "batter_hits"
-                                                                            for o in m.get("outcomes", [])
-                                                                            if o.get("point") == 0.5 and _norm(o.get("description","")) == _norm(player_name)
-                                              ) // 2  # divide by 2 because each player has over+under
+                    if sides["over"] is None or sides["under"] is None:
+                        continue
+                    key = normalize(player_name)
+                    existing = next(
+                        (r for r in results if normalize(r["player"]) == key), None
+                    )
+                    if existing:
+                        existing["booksAgreeing"] += 1
+                        if book_name == PREFERRED_BOOK:
+                            existing["overOdds"] = sides["over"]
+                            existing["underOdds"] = sides["under"]
+                            existing["book"] = PREFERRED_BOOK
+                    else:
                         results.append({
-                                                      "player":        player_name,
-                                                      "team":          team_abbr,
-                                                      "overOdds":      sides["over"],
-                                                      "underOdds":     sides["under"],
-                                                      "booksAgreeing": max(books_count, 1),
-                                                      "book":          book.get("title", "unknown"),
+                            "player": player_name,
+                            "team": "",
+                            "overOdds": sides["over"],
+                            "underOdds": sides["under"],
+                            "booksAgreeing": 1,
+                            "book": book_name,
                         })
-
-    log.info(f"Odds API: {len(results)} batter_hits 0.5 lines collected")
     return results
 
 
 # ──────────────────────────────────────────────
-# SECTION 2: ENRICHMENT ENGINE
+# SECTION 2: WEATHER PARSER
 # ──────────────────────────────────────────────
 
-def build_enriched_slate(
-      candidates: list[dict],
-      lineups:    list[dict],
-      weather:    list[dict],
-      odds:       list[dict],
-) -> list[dict]:
-      """
-          Merges the four data sources into the V7.1 dashboard JSON schema.
-              Never guesses missing slots or odds — leaves them null/empty.
-                  """
-    # Build lookup maps
-    lineup_map = {}
-    for r in lineups:
-              key = _norm(r.get("hitter", "")) + "|" + str(r.get("team", "")).upper()
-        lineup_map[key] = int(r["slot"])
+def parse_weather_context(row: dict) -> dict:
+    """
+    Convert a weather CSV row to {tempF, windOut, windIn, humidity, dome}.
+    Rules:
+    - 'dome' or 'indoors' in condition -> dome=True, no wind
+    - wind containing 'out' -> windOut=True
+    - wind containing 'in' -> windIn=True
+    - crosswind (L-R, R-L) -> both False
+    - N/A wind -> both False
+    """
+    condition = (row.get("condition") or "").lower()
+    temp_raw = row.get("tempF") or row.get("temp") or ""
+    wind_raw = (row.get("wind") or "").lower()
 
-    weather_map = {}
-    for r in weather:
-              team = str(r.get("team", "")).upper()
-        opp  = str(r.get("opp",  "")).upper()
-        game_key = "-".join(sorted([team, opp]))
-        cond = str(r.get("conditions", "")).lower()
-        wind = str(r.get("wind", "")).lower()
-        is_dome = "dome" in cond or "indoor" in cond or wind == "n/a"
-        temp_raw = r.get("tempF", "")
-        weather_map[game_key] = {
-                      "tempF":    None if is_dome else _parse_float(temp_raw),
-                      "windOut":  not is_dome and "out" in wind,
-                      "windIn":   not is_dome and "in"  in wind,
-                      "humidity": False,
-                      "dome":     is_dome,
+    is_dome = "dome" in condition or "indoor" in condition
+
+    if is_dome:
+        return {
+            "tempF": None,
+            "windOut": False,
+            "windIn": False,
+            "humidity": False,
+            "dome": True,
         }
 
-    odds_map = {}
-    for r in odds:
-              key = _norm(r.get("player", "")) + "|" + str(r.get("team", "")).upper()
-        odds_map[key] = {
-                      "overOdds":      r["overOdds"],
-                      "underOdds":     r["underOdds"],
-                      "booksAgreeing": r["booksAgreeing"],
-                      "marketKey":     "batter_hits",
-                      "line":          0.5,
-                      "sourceBook":    r.get("book", "manual"),
-        }
+    temp_f = _parse_float(temp_raw)
 
-    enriched = []
-    for r in candidates:
-              hitter = str(r.get("hitter", "")).strip()
-        team   = str(r.get("team",   "")).upper().strip()
-        opp    = str(r.get("opp",    "")).upper().strip()
-        pitcher = str(r.get("pitcher","")).strip()
+    wind_out = False
+    wind_in = False
+    if "n/a" not in wind_raw and wind_raw.strip():
+        if "out" in wind_raw:
+            wind_out = True
+        elif "in" in wind_raw:
+            wind_in = True
+        # crosswind: neither
 
-        lookup_key = _norm(hitter) + "|" + team
-        game_key   = "-".join(sorted([team, opp]))
+    humidity = "humid" in condition or "fog" in condition
 
-        slot      = lineup_map.get(lookup_key)
-        confirmed = slot is not None
-        mkt       = odds_map.get(lookup_key)
-        wx        = weather_map.get(game_key)
-
-        if not confirmed:
-                      log.info(f"No lineup match: {hitter} ({team}) — slot=null")
-        if mkt is None:
-                      log.info(f"No odds found: {hitter} ({team})")
-        if wx is None:
-                      log.info(f"No weather found: {team} vs {opp}")
-
-        row_id = re.sub(r"\s+", "_", _norm(hitter)) + "_" + team + "_" + opp
-
-        enriched.append({
-                      "id":      row_id,
-                      "hitter":  {
-                                        "name":      hitter  or None,
-                                        "team":      team    or None,
-                                        "opp":       opp     or None,
-                                        "slot":      slot,
-                                        "confirmed": confirmed,
-                      },
-                      "pitcher": {"name": pitcher or None},
-                      "context": wx  or {},
-                      "market":  mkt or {},
-        })
-
-    return enriched
-
-
-# ──────────────────────────────────────────────
-# SECTION 3: UTILITIES
-# ──────────────────────────────────────────────
-
-def _norm(s: str) -> str:
-      return re.sub(r"[^a-z0-9 ]", "", str(s or "").lower()).strip()
-
-def _parse_odds(v) -> int | None:
-      if v is None or str(v).strip() == "":
-                return None
-    try:
-              return int(float(re.sub(r"[^-0-9.]", "", str(v))))
-except (ValueError, TypeError):
-        return None
-
-def _parse_float(v) -> float | None:
-      if v is None or str(v).strip() == "":
-                return None
-    try:
-              return float(v)
-except (ValueError, TypeError):
-        return None
-
-def _parse_int(v) -> int | None:
-      if v is None or str(v).strip() == "":
-                return None
-    try:
-              return int(float(v))
-except (ValueError, TypeError):
-        return None
-
-def _guess_team_abbr(player_name: str, home_team: str, away_team: str) -> str:
-      """Placeholder — in a real impl, look up the player's team from a roster map."""
-    return "MLB"  # Will be replaced when roster API integration is added
-
-
-# ──────────────────────────────────────────────
-# SECTION 4: MAIN
-# ──────────────────────────────────────────────
-
-def main():
-      source_ts     = datetime.now(timezone.utc).isoformat()
-    enrichment_ts = source_ts  # same pass for now
-
-    log.info("=== MLB Hit Prop Enrichment Pipeline ===")
-    log.info(f"Source timestamp:     {source_ts}")
-
-    candidates = fetch_candidate_rows()
-    lineups    = fetch_confirmed_lineups()
-    weather    = fetch_weather()
-    odds       = fetch_batter_hits_odds()
-
-    log.info(f"Candidates: {len(candidates)}, Lineups: {len(lineups)}, "
-                          f"Weather: {len(weather)}, Odds: {len(odds)}")
-
-    enriched = build_enriched_slate(candidates, lineups, weather, odds)
-
-    output = {
-              "_meta": {
-                            "source_ts":     source_ts,
-                            "enrichment_ts": enrichment_ts,
-                            "row_count":     len(enriched),
-                            "schema":        "V7.1",
-              },
-              "slate": enriched,
+    return {
+        "tempF": temp_f,
+        "windOut": wind_out,
+        "windIn": wind_in,
+        "humidity": humidity,
+        "dome": False,
     }
 
+
+# ──────────────────────────────────────────────
+# SECTION 3: ENRICHMENT ENGINE
+# ──────────────────────────────────────────────
+
+def build_enriched_slate() -> list:
+    """
+    Main enrichment loop:
+    1. Load all data sources
+    2. For each candidate, match lineups, weather, odds
+    3. Build V7.1 JSON object
+    4. Return the slate array
+    """
+    source_ts = datetime.now(timezone.utc).isoformat()
+
+    candidates = fetch_candidate_rows()
+    if not candidates:
+        log.info("No candidates found -- slate will be empty")
+        return []
+
+    lineups = fetch_confirmed_lineups()
+    weather_rows = fetch_weather()
+    odds_rows = fetch_batter_hits_odds()
+
+    # Index for fast lookup
+    lineup_index = {}
+    for lr in lineups:
+        key = (lr.get("team", "").upper(), normalize(lr.get("hitter_name", "")))
+        lineup_index[key] = lr
+
+    weather_index = {}
+    for wr in weather_rows:
+        home = (wr.get("home_team") or "").upper()
+        away = (wr.get("away_team") or "").upper()
+        ctx = parse_weather_context(wr)
+        if home:
+            weather_index[home] = ctx
+        if away:
+            weather_index[away] = ctx
+
+    odds_index = {}
+    for od in odds_rows:
+        key = (od.get("team", "").upper(), normalize(od.get("player", "")))
+        odds_index[key] = od
+        # Also index by player name alone (for cross-team matching)
+        odds_index[("", normalize(od.get("player", "")))] = od
+
+    slate = []
+    for c in candidates:
+        hitter_name = (c.get("hitter_name") or "").strip()
+        team = (c.get("team") or "").strip().upper()
+        opp = (c.get("opp") or "").strip().upper()
+        pitcher_name = (c.get("pitcher_name") or "").strip()
+
+        if not hitter_name or not team:
+            log.warning(f"Skipping row with missing hitter/team: {c}")
+            continue
+
+        # --- Lineup slot ---
+        lu_key = (team, normalize(hitter_name))
+        lu_row = lineup_index.get(lu_key)
+        slot = None
+        confirmed = False
+        if lu_row:
+            slot = lu_row.get("slot")
+            confirmed = True
+
+        # --- Weather context ---
+        ctx = weather_index.get(team) or weather_index.get(opp) or {
+            "tempF": None,
+            "windOut": False,
+            "windIn": False,
+            "humidity": False,
+            "dome": False,
+        }
+
+        # --- Odds ---
+        odds_row = odds_index.get((team, normalize(hitter_name))) or                    odds_index.get(("", normalize(hitter_name)))
+        market = {}
+        if odds_row:
+            market = {
+                "overOdds": odds_row.get("overOdds"),
+                "underOdds": odds_row.get("underOdds"),
+                "booksAgreeing": odds_row.get("booksAgreeing", 1),
+                "marketKey": "batter_hits",
+                "line": 0.5,
+                "sourceBook": odds_row.get("book", "unknown"),
+            }
+
+        # --- Hitter stats from CSV (optional columns) ---
+        def _f(key):
+            return _parse_float(c.get(key))
+
+        hitter_obj = {
+            "name": hitter_name,
+            "team": team,
+            "opp": opp,
+            "slot": slot,
+            "confirmed": confirmed,
+        }
+        stat_map = {
+            "seasonBA": "seasonBA", "seasonwOBA": "seasonwOBA",
+            "xBA": "xBA", "xwOBA": "xwOBA",
+            "contact": "contact", "k": "k",
+            "l30PA": "l30PA", "l7BA": "l7BA", "l14BA": "l14BA",
+            "l21BA": "l21BA", "l7wOBA": "l7wOBA", "l14xwOBA": "l14xwOBA",
+            "l14Contact": "l14Contact", "l30xBA": "l30xBA",
+        }
+        for csv_col, json_key in stat_map.items():
+            val = _f(csv_col)
+            if val is not None:
+                hitter_obj[json_key] = val
+
+        # --- Pitcher stats from CSV (optional columns) ---
+        pitcher_obj = {"name": pitcher_name}
+        pitcher_stat_map = {
+            "xERA": "xERA", "stuffPlus": "stuffPlus",
+            "csw": "csw", "bb9": "bb9", "k9": "k9",
+        }
+        for csv_col, json_key in pitcher_stat_map.items():
+            val = _f(csv_col)
+            if val is not None:
+                pitcher_obj[json_key] = val
+
+        # --- Build ID ---
+        slot_str = str(slot) if slot is not None else "x"
+        team_lower = team.lower()
+        hitter_slug = re.sub(r"[^a-z0-9]", "_", hitter_name.lower())
+        record_id = f"{hitter_slug}_{team_lower}_{opp.lower()}_{slot_str}"
+
+        record = {
+            "id": record_id,
+            "hitter": hitter_obj,
+            "pitcher": pitcher_obj,
+            "context": ctx,
+        }
+        if market:
+            record["market"] = market
+
+        slate.append(record)
+
+    log.info(f"Built {len(slate)} enriched records")
+    return slate
+
+
+# ──────────────────────────────────────────────
+# SECTION 4: OUTPUT
+# ──────────────────────────────────────────────
+
+def write_output(slate: list):
+    """Write the enriched slate JSON to data/latest-enriched-slate.json."""
+    enrichment_ts = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "_meta": {
+            "source_ts": enrichment_ts,
+            "enrichment_ts": enrichment_ts,
+            "row_count": len(slate),
+            "schema": "V7.1",
+            "note": "Auto-generated by GitHub Action. Do not edit manually.",
+        },
+        "slate": slate,
+    }
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-              json.dump(output, f, indent=2)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    log.info(f"Wrote {len(slate)} records to {OUTPUT_FILE}")
 
-    log.info(f"Wrote {len(enriched)} enriched rows → {OUTPUT_FILE}")
 
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-      main()
+    log.info("=== MLB Hit Prop Enrichment Pipeline starting ===")
+    slate = build_enriched_slate()
+    write_output(slate)
+    log.info("=== Pipeline complete ===")
